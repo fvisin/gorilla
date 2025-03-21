@@ -2,7 +2,7 @@ import importlib
 import inspect
 import json
 
-from _compile_helper import function_to_json
+from utils._compile_helper import function_to_json
 from bfcl.constants.eval_config import MULTI_TURN_FUNC_DOC_PATH
 
 CLASS_FILE_PATH_MAPPING = {
