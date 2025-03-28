@@ -1,3 +1,4 @@
+import dataclasses
 import subprocess
 import threading
 import time
@@ -22,11 +23,48 @@ from overrides import EnforceOverrides, final, override
 from tqdm import tqdm
 
 
+# @dataclasses.dataclass
+# class Message:
+#     content: str
+#     role: str = ""
+#     tool_calls: list | None = None
+
+
+@dataclasses.dataclass
+class Choice:
+    # message: Message
+    text: str
+    formatted_prompt: str = ""
+    finish_reason: str = ""
+
+
+@dataclasses.dataclass
+class Usage:
+    completion_tokens: int = 0
+    prompt_tokens: int = 0
+    total_tokens: int = 0
+
+
+@dataclasses.dataclass
+class MockCompletion:
+    choices: list[Choice]
+    created: int = 0
+    id: str = ""
+    model: str = ""
+    object: str = "chat.completion.mock"
+    service_tier: str = ""
+    system_fingerprint: str = ""
+    usage: Usage = Usage()
+
+
 class OSSHandler(BaseHandler, EnforceOverrides):
-    def __init__(self, model_name, temperature, dtype="bfloat16") -> None:
+    def __init__(self, model_name, temperature,
+                 dry_run=True,  # TODO parameterize
+                 dtype="bfloat16") -> None:
         super().__init__(model_name, temperature)
         self.model_name_huggingface = model_name
         self.model_style = ModelStyle.OSSMODEL
+        self._dry_run = dry_run
         self.dtype = dtype
         # Read from env vars with fallbacks
         self.vllm_host = os.getenv("VLLM_ENDPOINT", "localhost")
@@ -71,166 +109,181 @@ class OSSHandler(BaseHandler, EnforceOverrides):
         """
         Batch inference for OSS models.
         """
-        from transformers import AutoConfig, AutoTokenizer
+        if self._dry_run:
+            with tqdm(
+                total=len(test_entries),
+                desc=f"Generating results for {self.model_name}",
+            ) as pbar:
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name_huggingface, trust_remote_code=True
-        )
-
-        config = AutoConfig.from_pretrained(
-            self.model_name_huggingface, trust_remote_code=True
-        )
-        if hasattr(config, "max_position_embeddings"):
-            self.max_context_length = config.max_position_embeddings
-        elif self.tokenizer.model_max_length is not None:
-            self.max_context_length = self.tokenizer.model_max_length
-        else:
-            if not hasattr(self, "max_context_length"):
-                raise ValueError(
-                    "Model does not have a max_position_embeddings attribute or tokenizer.model_max_length attribute. Please set the max_context_length attribute in the corresponding model handler."
-                )
-        print(f"Max context length: {self.max_context_length}")
-
-        if not skip_server_setup:
-            if backend == "vllm":
-                process = subprocess.Popen(
-                    [
-                        "vllm",
-                        "serve",
-                        str(self.model_name_huggingface),
-                        "--port",
-                        str(self.vllm_port),
-                        "--dtype",
-                        str(self.dtype),
-                        "--tensor-parallel-size",
-                        str(num_gpus),
-                        "--gpu-memory-utilization",
-                        str(gpu_memory_utilization),
-                        "--trust-remote-code",
-                    ],
-                    stdout=subprocess.PIPE,  # Capture stdout
-                    stderr=subprocess.PIPE,  # Capture stderr
-                    text=True,  # To get the output as text instead of bytes
-                )
-            elif backend == "sglang":
-
-                process = subprocess.Popen(
-                    [
-                        "python",
-                        "-m",
-                        "sglang.launch_server",
-                        "--model-path",
-                        str(self.model_name_huggingface),
-                        "--port",
-                        str(self.vllm_port),
-                        "--dtype",
-                        str(self.dtype),
-                        "--tp",
-                        str(num_gpus),
-                        "--mem-fraction-static",
-                        str(gpu_memory_utilization),
-                        "--trust-remote-code",
-                    ],
-                    stdout=subprocess.PIPE,  # Capture stdout
-                    stderr=subprocess.PIPE,  # Capture stderr
-                    text=True,  # To get the output as text instead of bytes
-                )
-            else:
-                raise ValueError(f"Backend {backend} is not supported.")
-
-            stop_event = threading.Event()
-            # Event to signal threads to stop; no need to see logs after server is ready
-
-            def log_subprocess_output(pipe, stop_event):
-                # Read lines until stop event is set
-                for line in iter(pipe.readline, ""):
-                    if stop_event.is_set():
-                        break
-                    else:
-                        print(line, end="")
-                pipe.close()
-                print("server log tracking thread stopped successfully.")
-
-            # Start threads to read and print stdout and stderr
-            stdout_thread = threading.Thread(
-                target=log_subprocess_output, args=(process.stdout, stop_event)
-            )
-            stderr_thread = threading.Thread(
-                target=log_subprocess_output, args=(process.stderr, stop_event)
-            )
-            stdout_thread.start()
-            stderr_thread.start()
-
-        try:
-            # Wait for the server to be ready
-            server_ready = False
-            while not server_ready:
-                # Check if the process has terminated unexpectedly
-                if not skip_server_setup and process.poll() is not None:
-                    # Output the captured logs
-                    stdout, stderr = process.communicate()
-                    print(stdout)
-                    print(stderr)
-                    raise Exception(
-                        f"Subprocess terminated unexpectedly with code {process.returncode}"
+                for test_case in test_entries:
+                    result = self._multi_threaded_inference(
+                        test_case,
+                        include_input_log,
+                        exclude_state_log,
                     )
-                try:
-                    # Make a simple request to check if the server is up
-                    response = requests.get(f"{self.base_url}/models")
-                    if response.status_code == 200:
-                        server_ready = True
-                        print("server is ready!")
-                except requests.exceptions.ConnectionError:
-                    # If the connection is not ready, wait and try again
-                    time.sleep(1)
+                    self.write(result, result_dir, update_mode=update_mode)
+                    pbar.update()
+        else:
+            from transformers import AutoConfig, AutoTokenizer
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name_huggingface, trust_remote_code=True
+            )
+
+            config = AutoConfig.from_pretrained(
+                self.model_name_huggingface, trust_remote_code=True
+            )
+            if hasattr(config, "max_position_embeddings"):
+                self.max_context_length = config.max_position_embeddings
+            elif self.tokenizer.model_max_length is not None:
+                self.max_context_length = self.tokenizer.model_max_length
+            else:
+                if not hasattr(self, "max_context_length"):
+                    raise ValueError(
+                        "Model does not have a max_position_embeddings attribute or tokenizer.model_max_length attribute. Please set the max_context_length attribute in the corresponding model handler."
+                    )
+            print(f"Max context length: {self.max_context_length}")
 
             if not skip_server_setup:
-                # Signal threads to stop reading output
-                stop_event.set()
+                if backend == "vllm":
+                    process = subprocess.Popen(
+                        [
+                            "vllm",
+                            "serve",
+                            str(self.model_name_huggingface),
+                            "--port",
+                            str(self.vllm_port),
+                            "--dtype",
+                            str(self.dtype),
+                            "--tensor-parallel-size",
+                            str(num_gpus),
+                            "--gpu-memory-utilization",
+                            str(gpu_memory_utilization),
+                            "--trust-remote-code",
+                        ],
+                        stdout=subprocess.PIPE,  # Capture stdout
+                        stderr=subprocess.PIPE,  # Capture stderr
+                        text=True,  # To get the output as text instead of bytes
+                    )
+                elif backend == "sglang":
 
-            # Once the server is ready, make the completion requests
-            futures = []
-            with ThreadPoolExecutor(max_workers=100) as executor:
-                with tqdm(
-                    total=len(test_entries),
-                    desc=f"Generating results for {self.model_name}",
-                ) as pbar:
+                    process = subprocess.Popen(
+                        [
+                            "python",
+                            "-m",
+                            "sglang.launch_server",
+                            "--model-path",
+                            str(self.model_name_huggingface),
+                            "--port",
+                            str(self.vllm_port),
+                            "--dtype",
+                            str(self.dtype),
+                            "--tp",
+                            str(num_gpus),
+                            "--mem-fraction-static",
+                            str(gpu_memory_utilization),
+                            "--trust-remote-code",
+                        ],
+                        stdout=subprocess.PIPE,  # Capture stdout
+                        stderr=subprocess.PIPE,  # Capture stderr
+                        text=True,  # To get the output as text instead of bytes
+                    )
+                else:
+                    raise ValueError(f"Backend {backend} is not supported.")
 
-                    for test_case in test_entries:
-                        future = executor.submit(
-                            self._multi_threaded_inference,
-                            test_case,
-                            include_input_log,
-                            exclude_state_log,
+                stop_event = threading.Event()
+                # Event to signal threads to stop; no need to see logs after server is ready
+
+                def log_subprocess_output(pipe, stop_event):
+                    # Read lines until stop event is set
+                    for line in iter(pipe.readline, ""):
+                        if stop_event.is_set():
+                            break
+                        else:
+                            print(line, end="")
+                    pipe.close()
+                    print("server log tracking thread stopped successfully.")
+
+                # Start threads to read and print stdout and stderr
+                stdout_thread = threading.Thread(
+                    target=log_subprocess_output, args=(process.stdout, stop_event)
+                )
+                stderr_thread = threading.Thread(
+                    target=log_subprocess_output, args=(process.stderr, stop_event)
+                )
+                stdout_thread.start()
+                stderr_thread.start()
+
+            try:
+                # Wait for the server to be ready
+                server_ready = False
+                while not server_ready:
+                    # Check if the process has terminated unexpectedly
+                    if not skip_server_setup and process.poll() is not None:
+                        # Output the captured logs
+                        stdout, stderr = process.communicate()
+                        print(stdout)
+                        print(stderr)
+                        raise Exception(
+                            f"Subprocess terminated unexpectedly with code {process.returncode}"
                         )
-                        futures.append(future)
+                    try:
+                        # Make a simple request to check if the server is up
+                        response = requests.get(f"{self.base_url}/models")
+                        if response.status_code == 200:
+                            server_ready = True
+                            print("server is ready!")
+                    except requests.exceptions.ConnectionError:
+                        # If the connection is not ready, wait and try again
+                        time.sleep(1)
 
-                    for future in futures:
-                        # This will wait for the task to complete, so that we are always writing in order
-                        result = future.result()
-                        self.write(result, result_dir, update_mode=update_mode)
-                        pbar.update()
+                if not skip_server_setup:
+                    # Signal threads to stop reading output
+                    stop_event.set()
 
-        except Exception as e:
-            raise e
+                # Once the server is ready, make the completion requests
+                futures = []
+                with ThreadPoolExecutor(max_workers=100) as executor:
+                    with tqdm(
+                        total=len(test_entries),
+                        desc=f"Generating results for {self.model_name}",
+                    ) as pbar:
 
-        finally:
-            if not skip_server_setup:
-                # Ensure the server process is terminated properly
-                process.terminate()
-                try:
-                    # Wait for the process to terminate fully
-                    process.wait(timeout=15)
-                    print("Process terminated successfully.")
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()  # Wait again to ensure it's fully terminated
-                    print("Process killed.")
+                        for test_case in test_entries:
+                            future = executor.submit(
+                                self._multi_threaded_inference,
+                                test_case,
+                                include_input_log,
+                                exclude_state_log,
+                            )
+                            futures.append(future)
 
-                # Wait for the output threads to finish
-                stop_event.set()
-                stdout_thread.join()
-                stderr_thread.join()
+                        for future in futures:
+                            # This will wait for the task to complete, so that we are always writing in order
+                            result = future.result()
+                            self.write(result, result_dir, update_mode=update_mode)
+                            pbar.update()
+
+            except Exception as e:
+                raise e
+
+            finally:
+                if not skip_server_setup:
+                    # Ensure the server process is terminated properly
+                    process.terminate()
+                    try:
+                        # Wait for the process to terminate fully
+                        process.wait(timeout=15)
+                        print("Process terminated successfully.")
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()  # Wait again to ensure it's fully terminated
+                        print("Process killed.")
+
+                    # Wait for the output threads to finish
+                    stop_event.set()
+                    stdout_thread.join()
+                    stderr_thread.join()
 
     @final
     def _multi_threaded_inference(
@@ -289,6 +342,15 @@ class OSSHandler(BaseHandler, EnforceOverrides):
         formatted_prompt: str = self._format_prompt(message, function)
         inference_data["inference_input_log"] = {"formatted_prompt": formatted_prompt}
 
+        if self._dry_run:
+            return MockCompletion(
+                choices=[
+                    Choice(
+                        text = message,
+                        formatted_prompt=formatted_prompt,
+                    )
+                ],
+                model=self.model_name_huggingface), 0
         # Tokenize the formatted prompt to get token count
         input_token_count = len(self.tokenizer.tokenize(formatted_prompt))
 
